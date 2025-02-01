@@ -291,10 +291,14 @@ async def unified_crawler(
             return []
     
     try:
-        while queue and len(results) < (max_pages or float('inf')):
+        while queue:
             # 检查时间限制
             if time_limit and (datetime.now() - start_time).seconds > time_limit:
                 print(f"达到时间限制 {time_limit}秒")
+                break
+
+            if max_pages and len(results) >= max_pages:
+                print(f"达到最大抓取页数 {max_pages}")
                 break
             
             # 批量处理
@@ -302,6 +306,7 @@ async def unified_crawler(
             del queue[:max_concurrent]
             
             tasks = [process_page(url, depth) for url, depth in batch]
+
             new_links = await asyncio.gather(*tasks)
             
             # 合并新链接到队列
@@ -367,6 +372,11 @@ def init_db():
             created_at DATETIME
         )
     ''')
+
+    # 新增索引
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_url ON site_pages(url)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_created ON site_pages(created_at)')
+
     conn.commit()
     conn.close()
 
