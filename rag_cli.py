@@ -38,10 +38,15 @@ def get_rag_db_connection():
     return sqlite3.connect('local_docs.db', check_same_thread=False)
 
 def retrieve_chunks(question_embedding: List[float], top_k: int = 3) -> List:
-    """优化后的检索实现"""
+    """添加表存在检查"""
     conn = get_rag_db_connection()
-    cursor = conn.cursor()
     try:
+        # 检查表是否存在
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='site_pages'")
+        if not cursor.fetchone():
+            return []
+            
         cursor.execute('SELECT url, chunk_number, content, metadata, embedding FROM site_pages')
         chunks = []
         for row in cursor.fetchall():

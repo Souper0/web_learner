@@ -7,12 +7,15 @@ from xml.etree import ElementTree
 from typing import List, Dict, Any
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from dotenv import load_dotenv
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
 from openai import AsyncOpenAI
 import sqlite3
+from bs4 import BeautifulSoup
+from defusedxml.ElementTree import parse  # 更安全的XML解析
+from io import BytesIO
 
 load_dotenv()
 
@@ -149,8 +152,9 @@ async def insert_chunk(chunk: ProcessedChunk):
     try:
         cursor.execute('''
             INSERT INTO site_pages 
+            (url, chunk_number, title, summary, content, metadata, embedding, created_at)
             VALUES (?,?,?,?,?,?,?,?)
-        ''', (
+        ''', (  # 明确指定列名
             chunk.url,
             chunk.chunk_number,
             chunk.title,
@@ -161,15 +165,41 @@ async def insert_chunk(chunk: ProcessedChunk):
             datetime.now(timezone.utc).isoformat()
         ))
         conn.commit()
-        print(f"成功插入分块 {chunk.chunk_number} 到 {chunk.url}")  # 添加成功日志
     except Exception as e:
         print(f"插入失败: {e}")
     finally:
         conn.close()
 
-async def process_and_store_document(url: str, markdown: str):
-    """Process a document and store its chunks in parallel."""
-    # Split into chunks
+@dataclass
+class ContentFilter:
+    include_keywords: List[str] = None
+    exclude_keywords: List[str] = None
+    css_selectors: List[str] = None  # 例如 ["article.main-content", "div.doc-section"]
+    max_content_length: int = 100000  # 防止抓取过大页面
+
+def should_keep_content(content: str, filter: ContentFilter) -> bool:
+    """内容过滤逻辑"""
+    # 长度过滤
+    if len(content) > filter.max_content_length:
+        return False
+    
+    # 关键词过滤
+    content_lower = content.lower()
+    if filter.include_keywords:
+        if not any(kw in content_lower for kw in filter.include_keywords):
+            return False
+    if filter.exclude_keywords:
+        if any(kw in content_lower for kw in filter.exclude_keywords):
+            return False
+    return True
+
+async def process_and_store_document(url: str, markdown: str, filter: ContentFilter = None):
+    """新增内容过滤参数"""
+    if filter and not should_keep_content(markdown, filter):
+        print(f"跳过不符合条件的内容: {url}")
+        return
+    
+    # 原有处理逻辑...
     chunks = chunk_text(markdown)
     
     # Process chunks in parallel
@@ -221,27 +251,83 @@ async def crawl_parallel(urls: List[str], max_concurrent: int = 5):
     finally:
         await crawler.close()
 
+async def discover_links(base_url: str, html: str) -> List[str]:
+    """从HTML中提取站内链接"""
+    soup = BeautifulSoup(html, 'html.parser')
+    links = []
+    for a in soup.find_all('a', href=True):
+        href = a['href']
+        full_url = urljoin(base_url, href)
+        if urlparse(full_url).netloc == urlparse(base_url).netloc:
+            links.append(full_url)
+    return list(set(links))  # 去重
+
+async def crawl_without_sitemap(base_url: str, max_depth: int = 2) -> List[str]:
+    """无sitemap时的递归抓取"""
+    browser_config = BrowserConfig(headless=True)
+    crawler = AsyncWebCrawler(config=browser_config)
+    await crawler.start()
+    
+    visited = set()
+    to_crawl = [(base_url, 0)]
+    all_urls = []
+    
+    try:
+        while to_crawl:
+            url, depth = to_crawl.pop(0)
+            if depth > max_depth or url in visited:
+                continue
+                
+            result = await crawler.arun(url, config=CrawlerRunConfig())
+            if result.success:
+                all_urls.append(url)
+                # 提取新链接
+                new_links = await discover_links(base_url, result.html)
+                to_crawl += [(link, depth+1) for link in new_links]
+                
+            visited.add(url)
+    finally:
+        await crawler.close()
+    
+    return all_urls
+
 def get_urls_from_sitemap() -> List[str]:
-    """Get URLs from sitemap.xml"""
+    """改进的sitemap解析方法"""
     if not os.getenv("WEB_URL"):
         print("warning: WEB_URL is not set")
         return []
+    
     sitemap_url = os.getenv("WEB_URL") + "/sitemap.xml"
     try:
-        response = requests.get(sitemap_url)
+        response = requests.get(sitemap_url, timeout=10)
         response.raise_for_status()
         
-        # Parse the XML
-        root = ElementTree.fromstring(response.content)
+        # 使用defusedxml防止XML攻击
+        tree = parse(BytesIO(response.content))
+        root = tree.getroot()
         
-        # Extract all URLs from the sitemap
-        namespace = {'ns': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
-        urls = [loc.text for loc in root.findall('.//ns:loc', namespace)]
+        # 处理可能的sitemap索引文件
+        if root.tag.endswith('sitemapindex'):
+            sitemaps = [loc.text for loc in root.findall('.//{http://www.sitemaps.org/schemas/sitemap/0.9}loc')]
+            urls = []
+            for sitemap in sitemaps:
+                try:
+                    sub_response = requests.get(sitemap, timeout=5)
+                    sub_tree = parse(BytesIO(sub_response.content))
+                    urls += [loc.text for loc in sub_tree.findall('.//{http://www.sitemaps.org/schemas/sitemap/0.9}loc')]
+                except Exception as e:
+                    print(f"解析子sitemap失败: {sitemap} - {e}")
+            return urls
         
-        return urls
+        # 直接解析普通sitemap
+        return [loc.text for loc in root.findall('.//{http://www.sitemaps.org/schemas/sitemap/0.9}loc')]
+    
     except Exception as e:
-        print(f"Error fetching sitemap: {e}")
-        return []
+        print(f"使用sitemap失败: {e}, 尝试递归抓取")
+        base_url = os.getenv("WEB_URL")
+        if not base_url:
+            return []
+        return asyncio.run(crawl_without_sitemap(base_url))
 
 def inspect_database(limit=3):
     """快速查看数据库内容"""
@@ -269,6 +355,30 @@ def inspect_database(limit=3):
     
     conn.close()
 
+def init_db():
+    conn = sqlite3.connect('local_docs.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS site_pages (
+            url TEXT,
+            chunk_number INTEGER,
+            title TEXT,
+            summary TEXT,
+            content TEXT,
+            metadata TEXT,
+            embedding TEXT,
+            created_at DATETIME
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def init_db_required(func):
+    def wrapper(*args, **kwargs):
+        init_db()
+        return func(*args, **kwargs)
+    return wrapper
+
 async def main():
     # Get URLs from sitemap.xml
     urls = get_urls_from_sitemap()
@@ -277,6 +387,7 @@ async def main():
         return
     
     print(f"Found {len(urls)} URLs to crawl")
+    init_db_required(init_db)()
     await crawl_parallel(urls)
     inspect_database()
 

@@ -5,7 +5,7 @@ import asyncio
 from typing import List
 import networkx as nx
 import matplotlib.pyplot as plt
-from crawl_web import crawl_parallel, get_urls_from_sitemap
+from crawl_web import crawl_parallel, get_urls_from_sitemap, init_db, init_db_required
 from rag_cli import retrieve_chunks, generate_answer
 import os
 
@@ -14,37 +14,40 @@ def get_db_connection():
     return sqlite3.connect('local_docs.db', check_same_thread=False)
 
 def build_knowledge_graph():
-    """修改后的知识图谱生成函数"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    G = nx.DiGraph()
-    
-    # 获取所有页面
-    cursor.execute("SELECT url, metadata FROM site_pages")
-    pages = {}
-    for url, metadata in cursor.fetchall():
-        meta = json.loads(metadata)
-        if url not in pages:
-            G.add_node(url, 
-                      title=meta.get('url_path', ''),
-                      size=meta.get('chunk_size', 0))
-            pages[url] = []
-        pages[url].append(meta)
-    
-    # 添加关联关系
-    for url in pages:
-        cursor.execute("SELECT content FROM site_pages WHERE url=?", (url,))
-        content = " ".join([row[0] for row in cursor.fetchall()])
-        if "http" in content:
-            links = [link for link in pages.keys() if link in content]
-            for link in links:
-                G.add_edge(url, link)
-    
-    plt.figure(figsize=(12, 8))
-    pos = nx.spring_layout(G)
-    nx.draw(G, pos, with_labels=True, node_size=200, font_size=8)
-    conn.close()  # 添加关闭连接
-    return plt.gcf()
+    """添加初始化装饰器"""
+    @init_db_required  # 新增装饰器
+    def _build_graph():
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        G = nx.DiGraph()
+        
+        # 获取所有页面
+        cursor.execute("SELECT url, metadata FROM site_pages")
+        pages = {}
+        for url, metadata in cursor.fetchall():
+            meta = json.loads(metadata)
+            if url not in pages:
+                G.add_node(url, 
+                          title=meta.get('url_path', ''),
+                          size=meta.get('chunk_size', 0))
+                pages[url] = []
+            pages[url].append(meta)
+        
+        # 添加关联关系
+        for url in pages:
+            cursor.execute("SELECT content FROM site_pages WHERE url=?", (url,))
+            content = " ".join([row[0] for row in cursor.fetchall()])
+            if "http" in content:
+                links = [link for link in pages.keys() if link in content]
+                for link in links:
+                    G.add_edge(url, link)
+        
+        plt.figure(figsize=(12, 8))
+        pos = nx.spring_layout(G)
+        nx.draw(G, pos, with_labels=True, node_size=200, font_size=8)
+        conn.close()  # 添加关闭连接
+        return plt.gcf()
+    return _build_graph()
 
 async def rag_pipeline(question: str):
     """修改后的RAG流程"""
@@ -151,6 +154,7 @@ def build_ui():
     return demo
 
 if __name__ == "__main__":
+    init_db()  # 显式初始化
     # 初始化知识图谱
     build_knowledge_graph()
     
