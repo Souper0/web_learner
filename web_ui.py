@@ -15,37 +15,125 @@ def get_db_connection():
 
 def build_knowledge_graph():
     """添加初始化装饰器"""
-    @init_db_required  # 新增装饰器
+    @init_db_required
     def _build_graph():
         conn = get_db_connection()
         cursor = conn.cursor()
         G = nx.DiGraph()
         
-        # 获取所有页面
-        cursor.execute("SELECT url, metadata FROM site_pages")
+        # 获取所有页面并处理标题
+        cursor.execute("SELECT url, metadata, COUNT(*) as chunk_count FROM site_pages GROUP BY url")
         pages = {}
-        for url, metadata in cursor.fetchall():
+        for url, metadata, chunk_count in cursor.fetchall():
             meta = json.loads(metadata)
-            if url not in pages:
-                G.add_node(url, 
-                          title=meta.get('url_path', ''),
-                          size=meta.get('chunk_size', 0))
-                pages[url] = []
-            pages[url].append(meta)
+            # 修改标题生成逻辑
+            if 'url_path' in meta and meta['url_path']:
+                # 使用 URL 路径的最后一部分作为标题
+                title = meta['url_path'].rstrip('/').split('/')[-1]
+            else:
+                # 如果没有 url_path，则使用 URL 的最后一部分
+                title = url.rstrip('/').split('/')[-1]
+            
+            # 如果标题为空，使用域名
+            if not title:
+                title = url.split('/')[2]  # 获取域名部分
+            
+            # 美化标题
+            title = title.replace('-', ' ').replace('_', ' ').title()
+            # 限制标题长度，确保可读性
+            title = title[:30] + '...' if len(title) > 30 else title
+            
+            pages[url] = {
+                "title": title,
+                "size": chunk_count * 50 + 100,
+                "depth": len(meta.get('url_path', '').split('/'))
+            }
+            G.add_node(url, **pages[url])
+        
+        # 如果没有数据时显示空图
+        if len(pages) == 0:
+            plt.figure(figsize=(8, 4))
+            plt.text(0.5, 0.5, 'No data available', ha='center', va='center')
+            plt.axis('off')
+            conn.close()
+            return plt.gcf()
         
         # 添加关联关系
+        cursor.execute("SELECT url, content FROM site_pages")
+        content_map = {url: content for url, content in cursor.fetchall()}
+        
         for url in pages:
-            cursor.execute("SELECT content FROM site_pages WHERE url=?", (url,))
-            content = " ".join([row[0] for row in cursor.fetchall()])
-            if "http" in content:
-                links = [link for link in pages.keys() if link in content]
+            if url in content_map and "http" in content_map[url]:
+                links = [link for link in pages.keys() if link in content_map[url]]
                 for link in links:
                     G.add_edge(url, link)
         
         plt.figure(figsize=(12, 8))
-        pos = nx.spring_layout(G)
-        nx.draw(G, pos, with_labels=True, node_size=200, font_size=8)
-        conn.close()  # 添加关闭连接
+        pos = nx.kamada_kawai_layout(G)  # 使用更清晰的布局算法
+        
+        # 根据路径深度设置颜色
+        colors = [node[1]['depth'] for node in G.nodes(data=True)]
+        # 根据分块数量设置大小
+        sizes = [node[1]['size'] for node in G.nodes(data=True)]
+        
+        # 绘制节点
+        nx.draw_networkx_nodes(
+            G, pos,
+            node_color=colors,
+            cmap=plt.cm.viridis,
+            node_size=sizes,
+            alpha=0.9,
+            edgecolors='grey'
+        )
+        
+        # 绘制边
+        nx.draw_networkx_edges(
+            G, pos,
+            width=1,
+            alpha=0.3,
+            edge_color='gray',
+            arrowsize=10
+        )
+        
+        # 修改标签绘制，确保标签可见
+        labels = {n[0]: n[1]['title'] for n in G.nodes(data=True)}
+        print("labels: ",labels)
+        nx.draw_networkx_labels(
+            G, pos,
+            labels=labels,
+            font_size=8,  # 减小字体以避免重叠
+            font_color='black',
+            font_weight='bold',
+            bbox=dict(
+                facecolor='white',
+                edgecolor='none',
+                alpha=0.7,
+                pad=0.5
+            )
+        )
+        
+        # 添加颜色条和图例（添加有效性检查）
+        if colors and len(set(colors)) > 1:  # 只在颜色数据有效时添加
+            sm = plt.cm.ScalarMappable(
+                cmap=plt.cm.viridis,
+                norm=plt.Normalize(vmin=min(colors), vmax=max(colors))
+            )
+            sm.set_array([])
+            cbar = plt.colorbar(sm, ax=plt.gca(), shrink=0.8)  # 显式指定ax参数
+            cbar.set_label('URL Path Depth')
+        elif colors:  # 所有节点颜色相同的情况
+            sm = plt.cm.ScalarMappable(
+                cmap=plt.cm.viridis,
+                norm=plt.Normalize(vmin=0, vmax=1)  # 设置默认范围
+            )
+            sm.set_array([])
+            cbar = plt.colorbar(sm, ax=plt.gca(), shrink=0.8)
+            cbar.set_label('URL Path Depth (All Same)')
+        
+        plt.title("Knowledge Graph", fontsize=16)
+        plt.axis('off')
+        # nx.draw(G, pos, with_labels=True)
+        conn.close()
         return plt.gcf()
     return _build_graph()
 
