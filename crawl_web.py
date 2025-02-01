@@ -202,41 +202,6 @@ async def process_and_store_document(url: str, markdown: str, filter: ContentFil
     ]
     await asyncio.gather(*insert_tasks)
 
-async def crawl_parallel(urls: List[str], max_concurrent: int = 5):
-    """Crawl multiple URLs in parallel with a concurrency limit."""
-    browser_config = BrowserConfig(
-        headless=True,
-        verbose=False,
-        extra_args=["--disable-gpu", "--disable-dev-shm-usage", "--no-sandbox"],
-    )
-    crawl_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS)
-
-    # Create the crawler instance
-    crawler = AsyncWebCrawler(config=browser_config)
-    await crawler.start()
-
-    try:
-        # Create a semaphore to limit concurrency
-        semaphore = asyncio.Semaphore(max_concurrent)
-        
-        async def process_url(url: str):
-            async with semaphore:
-                result = await crawler.arun(
-                    url=url,
-                    config=crawl_config,
-                    session_id="session1"
-                )
-                if result.success:
-                    print(f"Successfully crawled: {url}")
-                    await process_and_store_document(url, result.markdown_v2.raw_markdown)
-                else:
-                    print(f"Failed: {url} - Error: {result.error_message}")
-        
-        # Process all URLs in parallel with limited concurrency
-        await asyncio.gather(*[process_url(url) for url in urls])
-    finally:
-        await crawler.close()
-
 async def discover_links(base_url: str, html: str) -> List[str]:
     """基于目录结构的优先级链接发现"""
     soup = BeautifulSoup(html, 'html.parser')
@@ -276,10 +241,17 @@ def is_valid_link(url: str) -> bool:
     parsed = urlparse(url)
     return not any(ext in parsed.path for ext in ['.pdf', '.png', '.jpg']) 
 
-async def crawl_without_sitemap(base_url: str, max_depth: int = 2, max_concurrent: int = 8) -> List[str]:
-    """基于目录优先的并行递归抓取"""
+async def unified_crawler(
+    base_url: str,
+    max_depth: int = 3,
+    max_concurrent: int = 8,
+    max_pages: int = None,
+    time_limit: int = None
+) -> List[str]:
+    """整合后的统一抓取入口"""
     from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
     
+    # 初始化配置
     crawler = AsyncWebCrawler(config=BrowserConfig(
         headless=True,
         extra_args=["--disable-gpu", "--no-sandbox"]
@@ -287,56 +259,64 @@ async def crawl_without_sitemap(base_url: str, max_depth: int = 2, max_concurren
     await crawler.start()
     
     visited = set()
-    priority_queue = []
-    normal_queue = [(base_url, 0)]
-    all_urls = []
+    queue = [(base_url, 0)]  # (url, depth)
+    results = []
+    start_time = datetime.now()
     
-    async def process_batch(batch: list) -> list:
-        tasks = []
-        for url, depth in batch:
-            if url in visited or depth > max_depth:
-                continue
-            visited.add(url)
-            tasks.append(crawler.arun(url, CrawlerRunConfig(
+    async def process_page(url: str, depth: int):
+        """统一处理页面"""
+        if url in visited or depth > max_depth:
+            return []
+        visited.add(url)
+        
+        try:
+            # 执行抓取
+            result = await crawler.arun(url, CrawlerRunConfig(
                 cache_mode=CacheMode.BYPASS,
-            )))
-        return await asyncio.gather(*tasks, return_exceptions=True)
+            ))
+            
+            if not result.success:
+                return []
+            
+            # 处理内容
+            await process_and_store_document(url, result.markdown_v2.raw_markdown)
+            results.append(url)
+            
+            # 发现新链接
+            new_links = await discover_links(base_url, result.html)
+            return [(link, depth+1) for link in new_links if link not in visited]
+        
+        except Exception as e:
+            print(f"处理 {url} 失败: {str(e)[:100]}")
+            return []
     
     try:
-        while normal_queue or priority_queue:
-            # 优先处理目录链接
-            current_batch = []
-            while len(current_batch) < max_concurrent and priority_queue:
-                current_batch.append(priority_queue.pop(0))
+        while queue and len(results) < (max_pages or float('inf')):
+            # 检查时间限制
+            if time_limit and (datetime.now() - start_time).seconds > time_limit:
+                print(f"达到时间限制 {time_limit}秒")
+                break
             
-            # 补充普通链接
-            while len(current_batch) < max_concurrent and normal_queue:
-                current_batch.append(normal_queue.pop(0))
+            # 批量处理
+            batch = queue[:max_concurrent]
+            del queue[:max_concurrent]
             
-            results = await process_batch(current_batch)
+            tasks = [process_page(url, depth) for url, depth in batch]
+            new_links = await asyncio.gather(*tasks)
             
-            for (url, depth), result in zip(current_batch, results):
-                if isinstance(result, Exception):
-                    continue
-                
-                all_urls.append(url)
-                new_links = await discover_links(base_url, result.html)
-                
-                for link in new_links:
-                    if link not in visited:
-                        if is_directory_link(link):
-                            priority_queue.append((link, depth+1))
-                        else:
-                            normal_queue.append((link, depth+1))
+            # 合并新链接到队列
+            for links in new_links:
+                queue.extend(links)
             
-            # 内存优化
-            if len(all_urls) % 10 == 0:
-                await crawler._cleanup_sessions()
-                
+            # 进度报告
+            if len(results) % 10 == 0:
+                elapsed = (datetime.now() - start_time).total_seconds()
+                print(f"已抓取 {len(results)} 页 | 耗时: {elapsed:.1f}s")
+    
     finally:
         await crawler.close()
     
-    return all_urls
+    return results
 
 def is_directory_link(url: str) -> bool:
     """基于URL模式识别目录链接"""
@@ -345,13 +325,6 @@ def is_directory_link(url: str) -> bool:
         r'/nav/', r'index\.html$', r'_sidebar\.md'
     ]
     return any(re.search(p, url) for p in patterns)
-
-async def get_crawl_urls(base_url: str) -> List[str]:
-    """获取待抓取URL列表（优先sitemap）"""
-    if urls := get_urls_from_sitemap():
-        return urls
-    print("启用递归抓取...")
-    return await crawl_without_sitemap(base_url)
 
 def get_urls_from_sitemap() -> List[str]:
     """健壮的sitemap解析实现"""
@@ -432,44 +405,87 @@ def init_db_required(func):
         return func(*args, **kwargs)
     return wrapper
 
-async def estimate_total_pages(base_url: str) -> Tuple[int, str]:
-    """多策略页面估算"""
-    if sitemap_urls := get_urls_from_sitemap():
-        return (len(sitemap_urls), "sitemap")
+
+# 添加内存监控
+process = psutil.Process()
+def report_resources():
+    mem = process.memory_info().rss / 1024 / 1024
+    print(f"内存使用: {mem:.1f}MB")
+
+# 添加更详细的进度报告
+def report_progress(processed: int, total: int, start_time: datetime):
+    elapsed = (datetime.now() - start_time).total_seconds()
+    pages_per_sec = processed / elapsed if elapsed > 0 else 0
+    remaining = (total - processed) / pages_per_sec if pages_per_sec > 0 else 0
     
-    try:
-        async with AsyncWebCrawler() as crawler:
-            result = await crawler.arun(f"{base_url}/tutorials")
-            if result.success:
-                soup = BeautifulSoup(result.html, 'html.parser')
-                pagination = soup.select('.pagination a')
-                if pagination:
-                    max_page = max(int(p.text) for p in pagination if p.text.isdigit())
-                    return (max_page * 20, "pagination")  # 假设每页20项
-    except:
-        pass
-    
-    return (await crawl_without_sitemap(base_url, max_depth=1), "heuristic")
+    print(f"\n进度: {processed}/{total} ({processed/total:.1%})")
+    print(f"已用时间: {elapsed:.1f}s")
+    print(f"预估剩余时间: {remaining:.1f}s")
+    print(f"速度: {pages_per_sec:.1f} 页/秒")
 
 async def main():
+    """修复后的主函数交互流程"""
     base_url = os.getenv("WEB_URL")
     if not base_url:
         print("错误：未设置WEB_URL环境变量")
         return
     
-    # 预估页面数
-    total, method = await estimate_total_pages(base_url)
+    print(f"\n=== 抓取配置 ===")
+    print(f"目标网站: {base_url}")
     
-    if input(f"是否继续抓取？(y/n) ").lower() != 'y':
-        return
+    # 用户设置限制
+    max_pages = None
+    if input("\n是否设置最大抓取页数？(y/n) ").lower() == 'y':
+        while True:
+            try:
+                max_pages = int(input("请输入最大页数: "))
+                break
+            except ValueError:
+                print("输入无效，请重新输入数字！")
     
-    # 获取并处理URL
-    urls = await get_crawl_urls(base_url)
-    init_db_required(init_db)()
+    time_limit = None
+    if input("\n是否设置时间限制（秒）？(y/n) ").lower() == 'y':
+        while True:
+            try:
+                time_limit = int(input("请输入时间限制: "))
+                break
+            except ValueError:
+                print("输入无效，请重新输入数字！")
     
-    # 并行处理
-    await crawl_parallel(urls, max_concurrent=8)
+    # 显示最终配置
+    print("\n=== 开始抓取 ===")
+    print(f"并发数: 8")
+    print(f"最大页数: {max_pages or '无限制'}")
+    print(f"时间限制: {time_limit or '无限制'}秒")
+    
+    # 获取URL并抓取
+    urls = await unified_crawler(
+        base_url,
+        max_depth=3,
+        max_concurrent=8,
+        max_pages=max_pages,
+        time_limit=time_limit
+    )
+    init_db()
+    
+    print("开始抓取...")
+    await unified_crawler(
+        base_url,
+        max_depth=3,
+        max_concurrent=8,
+        max_pages=max_pages,
+        time_limit=time_limit
+    )
     inspect_database()
+
+# 测试限制条件
+async def test_limits():
+    await unified_crawler(
+        ["https://docs.example.com"]*100,
+        max_pages=5,
+        time_limit=10
+    )
+# 预期输出：处理5页或10秒后停止
 
 if __name__ == "__main__":
     asyncio.run(main())
