@@ -4,11 +4,13 @@ import json
 import asyncio
 import requests
 from xml.etree import ElementTree
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import urlparse, urljoin
 from dotenv import load_dotenv
+import psutil
+import re
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
 from openai import AsyncOpenAI
@@ -39,49 +41,33 @@ class ProcessedChunk:
     metadata: Dict[str, Any]
     embedding: List[float]
 
-def chunk_text(text: str, chunk_size: int = 5000) -> List[str]:
-    """Split text into chunks, respecting code blocks and paragraphs."""
+def chunk_text(text: str, chunk_size: int = 2000) -> List[str]:
     chunks = []
     start = 0
-    text_length = len(text)
-
-    while start < text_length:
-        # Calculate end position
-        end = start + chunk_size
-
-        # If we're at the end of the text, just take what's left
-        if end >= text_length:
-            chunks.append(text[start:].strip())
-            break
-
-        # Try to find a code block boundary first (```)
-        chunk = text[start:end]
-        code_block = chunk.rfind('```')
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        
+        # 优先在代码块边界分割
+        code_block = text[start:end].rfind('```')
         if code_block != -1 and code_block > chunk_size * 0.3:
-            end = start + code_block
-
-        # If no code block, try to break at a paragraph
-        elif '\n\n' in chunk:
-            # Find the last paragraph break
-            last_break = chunk.rfind('\n\n')
-            if last_break > chunk_size * 0.3:  # Only break if we're past 30% of chunk_size
+            end = start + code_block + 3
+        
+        # 其次在段落边界分割
+        elif '\n\n' in text[start:end]:
+            last_break = text[start:end].rfind('\n\n')
+            if last_break > chunk_size * 0.3:
                 end = start + last_break
-
-        # If no paragraph break, try to break at a sentence
-        elif '. ' in chunk:
-            # Find the last sentence break
-            last_period = chunk.rfind('. ')
-            if last_period > chunk_size * 0.3:  # Only break if we're past 30% of chunk_size
+        
+        # 最后在句子边界分割
+        elif '. ' in text[start:end]:
+            last_period = text[start:end].rfind('. ')
+            if last_period > chunk_size * 0.3:
                 end = start + last_period + 1
-
-        # Extract chunk and clean it up
+        
         chunk = text[start:end].strip()
         if chunk:
             chunks.append(chunk)
-
-        # Move start position for next chunk
-        start = max(start + 1, end)
-
+        start = end
     return chunks
 
 async def get_title_and_summary(chunk: str, url: str) -> Dict[str, str]:
@@ -252,82 +238,149 @@ async def crawl_parallel(urls: List[str], max_concurrent: int = 5):
         await crawler.close()
 
 async def discover_links(base_url: str, html: str) -> List[str]:
-    """从HTML中提取站内链接"""
+    """基于目录结构的优先级链接发现"""
     soup = BeautifulSoup(html, 'html.parser')
-    links = []
+    priority_links = []
+    other_links = []
+    
+    # 常见目录结构识别模式
+    directory_selectors = [
+        ('nav', {}),
+        ('div[class*="sidebar"]', {}),
+        ('div[class*="toc"]', {}),
+        ('div[class*="menu"]', {}),
+        ('ul[class*="nav"]', {}),
+        ('div[role="navigation"]', {}),
+        ('a[href*="/chapter"]', {}),
+        ('a[href*="/section"]', {}),
+    ]
+    
+    for selector, attrs in directory_selectors:
+        for element in soup.select(selector, attrs):
+            for a in element.find_all('a', href=True):
+                full_url = urljoin(base_url, a['href'])
+                if full_url not in priority_links:
+                    priority_links.append(full_url)
+    
+    # 提取其他链接并去重
     for a in soup.find_all('a', href=True):
-        href = a['href']
-        full_url = urljoin(base_url, href)
-        if urlparse(full_url).netloc == urlparse(base_url).netloc:
-            links.append(full_url)
-    return list(set(links))  # 去重
+        full_url = urljoin(base_url, a['href'])
+        if full_url not in priority_links and full_url not in other_links:
+            if is_valid_link(full_url):
+                other_links.append(full_url)
+    
+    return priority_links + other_links
 
-async def crawl_without_sitemap(base_url: str, max_depth: int = 2) -> List[str]:
-    """无sitemap时的递归抓取"""
-    browser_config = BrowserConfig(headless=True)
-    crawler = AsyncWebCrawler(config=browser_config)
+def is_valid_link(url: str) -> bool:
+    """过滤无效链接"""
+    parsed = urlparse(url)
+    return not any(ext in parsed.path for ext in ['.pdf', '.png', '.jpg']) 
+
+async def crawl_without_sitemap(base_url: str, max_depth: int = 2, max_concurrent: int = 8) -> List[str]:
+    """基于目录优先的并行递归抓取"""
+    from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+    
+    crawler = AsyncWebCrawler(config=BrowserConfig(
+        headless=True,
+        extra_args=["--disable-gpu", "--no-sandbox"]
+    ))
     await crawler.start()
     
     visited = set()
-    to_crawl = [(base_url, 0)]
+    priority_queue = []
+    normal_queue = [(base_url, 0)]
     all_urls = []
     
-    try:
-        while to_crawl:
-            url, depth = to_crawl.pop(0)
-            if depth > max_depth or url in visited:
+    async def process_batch(batch: list) -> list:
+        tasks = []
+        for url, depth in batch:
+            if url in visited or depth > max_depth:
                 continue
-                
-            result = await crawler.arun(url, config=CrawlerRunConfig())
-            if result.success:
-                all_urls.append(url)
-                # 提取新链接
-                new_links = await discover_links(base_url, result.html)
-                to_crawl += [(link, depth+1) for link in new_links]
-                
             visited.add(url)
+            tasks.append(crawler.arun(url, CrawlerRunConfig(
+                cache_mode=CacheMode.BYPASS,
+            )))
+        return await asyncio.gather(*tasks, return_exceptions=True)
+    
+    try:
+        while normal_queue or priority_queue:
+            # 优先处理目录链接
+            current_batch = []
+            while len(current_batch) < max_concurrent and priority_queue:
+                current_batch.append(priority_queue.pop(0))
+            
+            # 补充普通链接
+            while len(current_batch) < max_concurrent and normal_queue:
+                current_batch.append(normal_queue.pop(0))
+            
+            results = await process_batch(current_batch)
+            
+            for (url, depth), result in zip(current_batch, results):
+                if isinstance(result, Exception):
+                    continue
+                
+                all_urls.append(url)
+                new_links = await discover_links(base_url, result.html)
+                
+                for link in new_links:
+                    if link not in visited:
+                        if is_directory_link(link):
+                            priority_queue.append((link, depth+1))
+                        else:
+                            normal_queue.append((link, depth+1))
+            
+            # 内存优化
+            if len(all_urls) % 10 == 0:
+                await crawler._cleanup_sessions()
+                
     finally:
         await crawler.close()
     
     return all_urls
 
+def is_directory_link(url: str) -> bool:
+    """基于URL模式识别目录链接"""
+    patterns = [
+        r'/chapter/', r'/section\d+', r'/toc/', 
+        r'/nav/', r'index\.html$', r'_sidebar\.md'
+    ]
+    return any(re.search(p, url) for p in patterns)
+
+async def get_crawl_urls(base_url: str) -> List[str]:
+    """获取待抓取URL列表（优先sitemap）"""
+    if urls := get_urls_from_sitemap():
+        return urls
+    print("启用递归抓取...")
+    return await crawl_without_sitemap(base_url)
+
 def get_urls_from_sitemap() -> List[str]:
-    """改进的sitemap解析方法"""
-    if not os.getenv("WEB_URL"):
-        print("warning: WEB_URL is not set")
-        return []
-    
-    sitemap_url = os.getenv("WEB_URL") + "/sitemap.xml"
+    """健壮的sitemap解析实现"""
     try:
+        sitemap_url = f"{os.getenv('WEB_URL')}/sitemap.xml"
         response = requests.get(sitemap_url, timeout=10)
         response.raise_for_status()
         
-        # 使用defusedxml防止XML攻击
         tree = parse(BytesIO(response.content))
         root = tree.getroot()
         
-        # 处理可能的sitemap索引文件
+        # 处理嵌套sitemap
         if root.tag.endswith('sitemapindex'):
             sitemaps = [loc.text for loc in root.findall('.//{http://www.sitemaps.org/schemas/sitemap/0.9}loc')]
             urls = []
-            for sitemap in sitemaps:
+            for sitemap in sitemaps[:3]:  # 限制嵌套深度
                 try:
-                    sub_response = requests.get(sitemap, timeout=5)
-                    sub_tree = parse(BytesIO(sub_response.content))
+                    sub_resp = requests.get(sitemap, timeout=5)
+                    sub_tree = parse(BytesIO(sub_resp.content))
                     urls += [loc.text for loc in sub_tree.findall('.//{http://www.sitemaps.org/schemas/sitemap/0.9}loc')]
-                except Exception as e:
-                    print(f"解析子sitemap失败: {sitemap} - {e}")
+                except Exception:
+                    continue
             return urls
         
-        # 直接解析普通sitemap
         return [loc.text for loc in root.findall('.//{http://www.sitemaps.org/schemas/sitemap/0.9}loc')]
     
     except Exception as e:
-        print(f"使用sitemap失败: {e}, 尝试递归抓取")
-        base_url = os.getenv("WEB_URL")
-        if not base_url:
-            return []
-        return asyncio.run(crawl_without_sitemap(base_url))
+        print(f"Sitemap解析失败: {str(e)[:200]}")
+        return []
 
 def inspect_database(limit=3):
     """快速查看数据库内容"""
@@ -379,16 +432,43 @@ def init_db_required(func):
         return func(*args, **kwargs)
     return wrapper
 
+async def estimate_total_pages(base_url: str) -> Tuple[int, str]:
+    """多策略页面估算"""
+    if sitemap_urls := get_urls_from_sitemap():
+        return (len(sitemap_urls), "sitemap")
+    
+    try:
+        async with AsyncWebCrawler() as crawler:
+            result = await crawler.arun(f"{base_url}/tutorials")
+            if result.success:
+                soup = BeautifulSoup(result.html, 'html.parser')
+                pagination = soup.select('.pagination a')
+                if pagination:
+                    max_page = max(int(p.text) for p in pagination if p.text.isdigit())
+                    return (max_page * 20, "pagination")  # 假设每页20项
+    except:
+        pass
+    
+    return (await crawl_without_sitemap(base_url, max_depth=1), "heuristic")
+
 async def main():
-    # Get URLs from sitemap.xml
-    urls = get_urls_from_sitemap()
-    if not urls:
-        print("warning: No URLs found to crawl")
+    base_url = os.getenv("WEB_URL")
+    if not base_url:
+        print("错误：未设置WEB_URL环境变量")
         return
     
-    print(f"Found {len(urls)} URLs to crawl")
+    # 预估页面数
+    total, method = await estimate_total_pages(base_url)
+    
+    if input(f"是否继续抓取？(y/n) ").lower() != 'y':
+        return
+    
+    # 获取并处理URL
+    urls = await get_crawl_urls(base_url)
     init_db_required(init_db)()
-    await crawl_parallel(urls)
+    
+    # 并行处理
+    await crawl_parallel(urls, max_concurrent=8)
     inspect_database()
 
 if __name__ == "__main__":
