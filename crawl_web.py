@@ -326,35 +326,6 @@ def is_directory_link(url: str) -> bool:
     ]
     return any(re.search(p, url) for p in patterns)
 
-def get_urls_from_sitemap() -> List[str]:
-    """健壮的sitemap解析实现"""
-    try:
-        sitemap_url = f"{os.getenv('WEB_URL')}/sitemap.xml"
-        response = requests.get(sitemap_url, timeout=10)
-        response.raise_for_status()
-        
-        tree = parse(BytesIO(response.content))
-        root = tree.getroot()
-        
-        # 处理嵌套sitemap
-        if root.tag.endswith('sitemapindex'):
-            sitemaps = [loc.text for loc in root.findall('.//{http://www.sitemaps.org/schemas/sitemap/0.9}loc')]
-            urls = []
-            for sitemap in sitemaps[:3]:  # 限制嵌套深度
-                try:
-                    sub_resp = requests.get(sitemap, timeout=5)
-                    sub_tree = parse(BytesIO(sub_resp.content))
-                    urls += [loc.text for loc in sub_tree.findall('.//{http://www.sitemaps.org/schemas/sitemap/0.9}loc')]
-                except Exception:
-                    continue
-            return urls
-        
-        return [loc.text for loc in root.findall('.//{http://www.sitemaps.org/schemas/sitemap/0.9}loc')]
-    
-    except Exception as e:
-        print(f"Sitemap解析失败: {str(e)[:200]}")
-        return []
-
 def inspect_database(limit=3):
     """快速查看数据库内容"""
     conn = sqlite3.connect('local_docs.db')
@@ -478,14 +449,6 @@ async def main():
     )
     inspect_database()
 
-# 测试限制条件
-async def test_limits():
-    await unified_crawler(
-        ["https://docs.example.com"]*100,
-        max_pages=5,
-        time_limit=10
-    )
-# 预期输出：处理5页或10秒后停止
 
 if __name__ == "__main__":
     asyncio.run(main())

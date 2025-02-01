@@ -5,7 +5,7 @@ import asyncio
 from typing import List
 import networkx as nx
 import matplotlib.pyplot as plt
-from crawl_web import crawl_parallel, get_urls_from_sitemap, init_db, init_db_required
+from crawl_web import init_db, init_db_required, unified_crawler
 from rag_cli import retrieve_chunks, generate_answer
 import os
 
@@ -96,9 +96,19 @@ def build_ui():
         with gr.Tab("🌐 网页抓取"):
             with gr.Row():
                 url_input = gr.Textbox(label="输入网址", placeholder="https://example.com")
-                sitemap_btn = gr.Button("从sitemap抓取")
-            crawl_btn = gr.Button("开始抓取", variant="primary")
-            progress = gr.Slider(visible=False, label="抓取进度")
+            with gr.Row():
+                max_pages_input = gr.Number(label="最大抓取页数", value=100, precision=0)
+                time_limit_input = gr.Number(label="时间限制(秒)", value=300, precision=0)
+            with gr.Row():
+                crawl_btn = gr.Button("开始抓取", variant="primary")
+                # stop_btn = gr.Button("停止抓取")
+            progress = gr.Slider(visible=True, label="抓取进度", interactive=False)
+            gr.Markdown("### 实时统计")
+            stats_panel = gr.JSON(label="抓取统计", value={
+                "已抓取页面": 0,
+                "剩余页面": 0,
+                "预计剩余时间": "N/A"
+            }, every=5)
             log_output = gr.Textbox(label="操作日志", interactive=False)
         
         with gr.Tab("❓ 问答"):
@@ -133,21 +143,22 @@ def build_ui():
 
         # 事件处理
         crawl_btn.click(
-            fn=lambda url: asyncio.run(crawl_parallel([url])),
-            inputs=url_input,
-            outputs=log_output
+            fn=lambda url, max_p, time_l: asyncio.run(unified_crawler(base_url=url, max_pages=max_p, time_limit=time_l)),
+            inputs=[url_input, max_pages_input, time_limit_input],
+            outputs=[stats_panel, log_output]
         )
         
-        sitemap_btn.click(
-            lambda: (get_urls_from_sitemap(), "开始抓取sitemap..."),
-            outputs=[url_input, log_output]
-        )
         
         ask_btn.click(
             rag_pipeline,
             inputs=question_input,
             outputs=[answer_output, sources_output]
         )
+        
+        # stop_btn.click(
+        #     fn=lambda: setattr(crawler, 'should_stop', True),
+        #     outputs=None
+        # )
         
         demo.load(build_knowledge_graph, outputs=plot)
 
@@ -164,4 +175,29 @@ if __name__ == "__main__":
         server_name="0.0.0.0",
         server_port=7860,
         share=False
-    ) 
+    )
+
+async def start_crawling(url: str, max_pages: int, time_limit: int):
+    from crawl_web import unified_crawler
+    try:
+        await unified_crawler(
+            base_url=url,
+            max_depth=3,
+            max_concurrent=8,
+            max_pages=max_pages,
+            time_limit=time_limit
+        )
+        return get_db_stats(), "抓取完成！"
+    except Exception as e:
+        return get_db_stats(), f"抓取中断: {str(e)}"
+
+def get_crawl_stats():
+    conn = sqlite3.connect('local_docs.db')
+    cursor = conn.cursor()
+    stats = {
+        "已抓取页面": cursor.execute("SELECT COUNT(DISTINCT url) FROM site_pages").fetchone()[0],
+        "剩余页面": "N/A",  # 需要crawler提供实时数据
+        "预计剩余时间": "N/A"  # 需要计算逻辑
+    }
+    conn.close()
+    return stats 
