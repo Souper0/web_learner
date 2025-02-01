@@ -439,14 +439,6 @@ async def main():
     print(f"最大页数: {max_pages or '无限制'}")
     print(f"时间限制: {time_limit or '无限制'}秒")
     
-    # 获取URL并抓取
-    urls = await unified_crawler(
-        base_url,
-        max_depth=3,
-        max_concurrent=8,
-        max_pages=max_pages,
-        time_limit=time_limit
-    )
     init_db()
     
     print("开始抓取...")
