@@ -202,8 +202,24 @@ async def process_and_store_document(url: str, markdown: str, filter: ContentFil
     ]
     await asyncio.gather(*insert_tasks)
 
+def is_valid_link(url: str) -> bool:
+    """过滤无效链接"""
+    parsed = urlparse(url)
+    base_domain = urlparse(os.getenv("WEB_URL")).netloc  # 获取配置的基准域名
+    
+    # 新增域名验证
+    if parsed.netloc != base_domain:
+        return False
+    
+    # 原有文件类型过滤
+    if any(ext in parsed.path for ext in ['.pdf', '.png', '.jpg']):
+        return False
+        
+    return True
+
 async def discover_links(base_url: str, html: str) -> List[str]:
     """基于目录结构的优先级链接发现"""
+    base_domain = urlparse(base_url).netloc  # 获取当前页面的域名
     soup = BeautifulSoup(html, 'html.parser')
     priority_links = []
     other_links = []
@@ -224,22 +240,20 @@ async def discover_links(base_url: str, html: str) -> List[str]:
         for element in soup.select(selector, attrs):
             for a in element.find_all('a', href=True):
                 full_url = urljoin(base_url, a['href'])
-                if full_url not in priority_links:
-                    priority_links.append(full_url)
+                if urlparse(full_url).netloc == base_domain:  # 新增检查
+                    if full_url not in priority_links:
+                        priority_links.append(full_url)
     
     # 提取其他链接并去重
     for a in soup.find_all('a', href=True):
         full_url = urljoin(base_url, a['href'])
-        if full_url not in priority_links and full_url not in other_links:
+        parsed = urlparse(full_url)
+        # 增加严格域名检查
+        if parsed.netloc == base_domain and full_url not in priority_links and full_url not in other_links:
             if is_valid_link(full_url):
                 other_links.append(full_url)
     
     return priority_links + other_links
-
-def is_valid_link(url: str) -> bool:
-    """过滤无效链接"""
-    parsed = urlparse(url)
-    return not any(ext in parsed.path for ext in ['.pdf', '.png', '.jpg']) 
 
 async def unified_crawler(
     base_url: str,
