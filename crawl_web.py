@@ -16,19 +16,15 @@ import sqlite3
 
 load_dotenv()
 
-llm_client = AsyncOpenAI(
-    api_key=os.getenv("API_KEY"),
-    base_url=os.getenv("BASE_URL")  
+llm_chat_client = AsyncOpenAI(
+    api_key=os.getenv("CHAT_API_KEY"),
+    base_url=os.getenv("CHAT_BASE_URL")  
 )
 
-conn = sqlite3.connect('local_docs.db')
-cursor = conn.cursor()
-# Create table if not exists
-cursor.execute('''CREATE TABLE IF NOT EXISTS site_pages
-             (url TEXT, chunk_number INTEGER, title TEXT, 
-              summary TEXT, content TEXT, metadata TEXT, 
-              embedding BLOB)''')
-conn.commit()
+llm_embedding_client = AsyncOpenAI(
+    api_key=os.getenv("EMBEDDING_API_KEY"),
+    base_url=os.getenv("EMBEDDING_BASE_URL")  
+)
 
 @dataclass
 class ProcessedChunk:
@@ -94,10 +90,11 @@ async def get_title_and_summary(chunk: str, url: str) -> Dict[str, str]:
     Keep both title and summary concise but informative."""
     
     try:
-        response = await llm_client.chat.completions.create(
+        response = await llm_chat_client.chat.completions.create(
             model=os.getenv("CHAT_MODEL", "qwen-plus"),  
             messages=[
                 {"role": "system", "content": system_prompt},
+
                 {"role": "user", "content": f"URL: {url}\n\nContent:\n{chunk[:1000]}..."}
             ],
             response_format={ "type": "json_object" }
@@ -111,7 +108,7 @@ async def get_title_and_summary(chunk: str, url: str) -> Dict[str, str]:
 async def get_embedding(text: str) -> List[float]:
     """Get embedding from QWen instead of OpenAI"""
     try:
-        response = await llm_client.embeddings.create(
+        response = await llm_embedding_client.embeddings.create(
             model=os.getenv("EMBEDDING_MODEL", "text-embedding-v3"),  
             input=text
         )
@@ -147,7 +144,9 @@ async def process_chunk(chunk: str, chunk_number: int, url: str) -> ProcessedChu
     )
 
 async def insert_chunk(chunk: ProcessedChunk):
-    """Store in SQLite instead of Supabase"""
+    """线程安全的存储实现"""
+    conn = sqlite3.connect('local_docs.db')
+    cursor = conn.cursor()
     try:
         data = (
             chunk.url,
@@ -162,10 +161,10 @@ async def insert_chunk(chunk: ProcessedChunk):
         cursor.execute('''INSERT INTO site_pages 
                        (url, chunk_number, title, summary, content, metadata, embedding)
                        VALUES (?, ?, ?, ?, ?, ?, ?)''', data)
-        conn.commit()
         print(f"Inserted chunk {chunk.chunk_number} for {chunk.url}")
-    except Exception as e:
-        print(f"Error inserting chunk: {e}")
+    finally:
+        conn.commit()
+        conn.close()
 
 async def process_and_store_document(url: str, markdown: str):
     """Process a document and store its chunks in parallel."""
