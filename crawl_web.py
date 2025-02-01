@@ -88,7 +88,7 @@ async def get_title_and_summary(chunk: str, url: str) -> Dict[str, str]:
             ],
             response_format={ "type": "json_object" }
         )
-        print(response.choices[0].message.content)
+        # print(response.choices[0].message.content)
         return json.loads(response.choices[0].message.content)
     except Exception as e:
         print(f"Error getting title and summary: {e}")
