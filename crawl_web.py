@@ -144,26 +144,27 @@ async def process_chunk(chunk: str, chunk_number: int, url: str) -> ProcessedChu
     )
 
 async def insert_chunk(chunk: ProcessedChunk):
-    """线程安全的存储实现"""
     conn = sqlite3.connect('local_docs.db')
     cursor = conn.cursor()
     try:
-        data = (
+        cursor.execute('''
+            INSERT INTO site_pages 
+            VALUES (?,?,?,?,?,?,?,?)
+        ''', (
             chunk.url,
             chunk.chunk_number,
             chunk.title,
             chunk.summary,
             chunk.content,
             json.dumps(chunk.metadata),
-            json.dumps(chunk.embedding)
-        )
-        
-        cursor.execute('''INSERT INTO site_pages 
-                       (url, chunk_number, title, summary, content, metadata, embedding)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)''', data)
-        print(f"Inserted chunk {chunk.chunk_number} for {chunk.url}")
-    finally:
+            json.dumps(chunk.embedding),
+            datetime.now(timezone.utc).isoformat()
+        ))
         conn.commit()
+        print(f"成功插入分块 {chunk.chunk_number} 到 {chunk.url}")  # 添加成功日志
+    except Exception as e:
+        print(f"插入失败: {e}")
+    finally:
         conn.close()
 
 async def process_and_store_document(url: str, markdown: str):

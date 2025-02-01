@@ -7,13 +7,16 @@ import networkx as nx
 import matplotlib.pyplot as plt
 from crawl_web import crawl_parallel, get_urls_from_sitemap
 from rag_cli import retrieve_chunks, generate_answer
+import os
 
-# 数据库连接
-conn = sqlite3.connect('local_docs.db')
-cursor = conn.cursor()
+def get_db_connection():
+    """为每个线程创建独立的数据库连接"""
+    return sqlite3.connect('local_docs.db', check_same_thread=False)
 
 def build_knowledge_graph():
-    """生成知识图谱可视化"""
+    """修改后的知识图谱生成函数"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
     G = nx.DiGraph()
     
     # 获取所有页面
@@ -40,10 +43,13 @@ def build_knowledge_graph():
     plt.figure(figsize=(12, 8))
     pos = nx.spring_layout(G)
     nx.draw(G, pos, with_labels=True, node_size=200, font_size=8)
+    conn.close()  # 添加关闭连接
     return plt.gcf()
 
 async def rag_pipeline(question: str):
-    """适配前端的RAG流程"""
+    """修改后的RAG流程"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
     from rag_cli import get_embedding  # 延迟导入避免冲突
     
     question_embedding = await get_embedding(question)
@@ -55,7 +61,29 @@ async def rag_pipeline(question: str):
     context = "\n\n".join([f"[来源：{c['metadata']['url_path']}]\n{c['content']}" for c in chunks])
     answer = await generate_answer(question, context)
     sources = "\n".join([f"- {c['source']}" for c in chunks])
+    conn.close()
     return answer, sources
+
+def get_db_data():
+    """线程安全的数据库查询"""
+    conn = sqlite3.connect('local_docs.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT url, COUNT(*) FROM site_pages GROUP BY url")
+    data = cursor.fetchall()
+    conn.close()
+    return data
+
+def get_db_stats():
+    """获取统计信息"""
+    conn = sqlite3.connect('local_docs.db')
+    cursor = conn.cursor()
+    stats = {
+        "总页面数": cursor.execute("SELECT COUNT(DISTINCT url) FROM site_pages").fetchone()[0],
+        "总分块数": cursor.execute("SELECT COUNT(*) FROM site_pages").fetchone()[0],
+        "存储大小": f"{os.path.getsize('local_docs.db')/1024/1024:.2f} MB"
+    }
+    conn.close()
+    return stats
 
 def build_ui():
     """构建完整的前端界面"""
@@ -92,21 +120,17 @@ def build_ui():
                         interactive=False
                     )
                     gr.Button("刷新数据").click(
-                        lambda: cursor.execute("SELECT url, COUNT(*) FROM site_pages GROUP BY url").fetchall(),
+                        get_db_data,  # 直接使用封装好的函数
                         outputs=db_view
                     )
             gr.Button("更新统计").click(
-                lambda: {
-                    "总页面数": cursor.execute("SELECT COUNT(DISTINCT url) FROM site_pages").fetchone()[0],
-                    "总分块数": cursor.execute("SELECT COUNT(*) FROM site_pages").fetchone()[0],
-                    "存储大小": f"{os.path.getsize('local_docs.db')/1024/1024:.2f} MB"
-                },
+                get_db_stats,  # 使用封装好的统计函数
                 outputs=stats
             )
 
         # 事件处理
         crawl_btn.click(
-            lambda url: asyncio.run(crawl_parallel([url])),
+            fn=lambda url: asyncio.run(crawl_parallel([url])),
             inputs=url_input,
             outputs=log_output
         )

@@ -10,10 +10,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# 复用已有的数据库连接
-conn = sqlite3.connect('local_docs.db')
-cursor = conn.cursor()
-
 # 复用已有的OpenAI客户端配置
 llm_chat_client = AsyncOpenAI(
     api_key=os.getenv("CHAT_API_KEY"),
@@ -24,7 +20,6 @@ llm_embedding_client = AsyncOpenAI(
     api_key=os.getenv("EMBEDDING_API_KEY"),
     base_url=os.getenv("EMBEDDING_BASE_URL")  
 )
-
 
 async def get_embedding(text: str) -> List[float]:
     """复用已有的embedding获取函数"""
@@ -38,8 +33,14 @@ async def get_embedding(text: str) -> List[float]:
         print(f"Error getting embedding: {e}")
         return [0] * 1024
 
+def get_rag_db_connection():
+    """创建线程安全的数据库连接"""
+    return sqlite3.connect('local_docs.db', check_same_thread=False)
+
 def retrieve_chunks(question_embedding: List[float], top_k: int = 3) -> List:
     """优化后的检索实现"""
+    conn = get_rag_db_connection()
+    cursor = conn.cursor()
     try:
         cursor.execute('SELECT url, chunk_number, content, metadata, embedding FROM site_pages')
         chunks = []
@@ -58,6 +59,8 @@ def retrieve_chunks(question_embedding: List[float], top_k: int = 3) -> List:
     except Exception as e:
         print(f"检索失败: {e}")
         return []
+    finally:
+        conn.close()  # 确保关闭连接
 
 async def generate_answer(question: str, context: str) -> str:
     """优化后的答案生成"""
