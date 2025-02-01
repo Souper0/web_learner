@@ -24,3 +24,15 @@ rich>=13.0.0   # 终端美化
 # 其他工具
 tenacity>=8.2.0  # 重试机制
 python-dateutil>=2.8.0  # 日期处理
+
+# 机器学习
+# torch>=2.0.0  # 可选，为后续模型微调准备
+# transformers>=4.30.0  # 可选
+
+# 可视化
+gradio>=3.0.0  # 前端UI
+matplotlib>=3.7.0  # 知识图谱绘制
+networkx>=3.0  # 知识图谱构建
+
+# 其他工具
+requests>=2.28.0  # HTTP请求

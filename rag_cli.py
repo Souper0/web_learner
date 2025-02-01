@@ -15,15 +15,21 @@ conn = sqlite3.connect('local_docs.db')
 cursor = conn.cursor()
 
 # 复用已有的OpenAI客户端配置
-llm_client = AsyncOpenAI(
-    api_key=os.getenv("API_KEY"),
-    base_url=os.getenv("BASE_URL")  
+llm_chat_client = AsyncOpenAI(
+    api_key=os.getenv("CHAT_API_KEY"),
+    base_url=os.getenv("CHAT_BASE_URL")  
 )
+
+llm_embedding_client = AsyncOpenAI(
+    api_key=os.getenv("EMBEDDING_API_KEY"),
+    base_url=os.getenv("EMBEDDING_BASE_URL")  
+)
+
 
 async def get_embedding(text: str) -> List[float]:
     """复用已有的embedding获取函数"""
     try:
-        response = await llm_client.embeddings.create(
+        response = await llm_embedding_client.embeddings.create(
             model=os.getenv("EMBEDDING_MODEL", "text-embedding-v3"),  
             input=text
         )
@@ -64,12 +70,13 @@ async def generate_answer(question: str, context: str) -> str:
     {context}"""
     
     try:
-        response = await llm_client.chat.completions.create(
-            model=os.getenv("CHAT_MODEL", "qwen-plus"),
+        response = await llm_chat_client.chat.completions.create(
+            model=os.getenv("CHAT_MODEL", "deepseek-reasoner"),
             messages=[
                 {"role": "system", "content": system_prompt.format(context=context)},
                 {"role": "user", "content": question}
-            ]
+            ],
+            temperature=0.5,
         )
         return response.choices[0].message.content
     except Exception as e:
@@ -81,7 +88,7 @@ async def rag_process(question: str):
     question_embedding = await get_embedding(question)
     
     # 检索相关段落
-    chunks = retrieve_chunks(question_embedding)
+    chunks = retrieve_chunks(question_embedding, top_k=7)
     
     if not chunks:
         print("没有找到相关上下文信息")
@@ -89,7 +96,7 @@ async def rag_process(question: str):
     
     # 组合上下文
     context = "\n\n".join([
-        f"[来源：{c['metadata']['url_path']} (相似度: {c['similarity']:.2f})]\n{c['content']}" 
+        f"[来源：{c['metadata']['url_path']} (相似度: {c['similarity']:.5f})]\n{c['content']}" 
         for c in chunks
     ])
     
@@ -101,7 +108,7 @@ async def rag_process(question: str):
     print("="*50)
     print("\n相关来源：")
     for c in chunks:
-        print(f"- {c['source']} (相似度: {c['similarity']:.2f})")
+        print(f"- {c['source']} (相似度: {c['similarity']:.4f})")
 
 def main():
     """命令行交互主循环"""
